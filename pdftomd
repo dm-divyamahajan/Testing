@@ -1,0 +1,1129 @@
+# PDF to HTML to Markdown Converter
+
+I'll create a complete solution with multiple approaches. Here's a comprehensive implementation:
+
+## Project Structure
+
+```
+pdf-converter/
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── index.ts
+│   ├── pdfToHtml.ts
+│   ├── htmlToMd.ts
+│   └── utils.ts
+└── input/
+    └── profile.pdf
+```
+
+## 1. Package.json
+
+```json
+{
+  "name": "pdf-to-html-to-md",
+  "version": "1.0.0",
+  "description": "Convert PDF to HTML to Markdown",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^3.11.174",
+    "turndown": "^7.1.2",
+    "turndown-plugin-gfm": "^1.0.2",
+    "canvas": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/turndown": "^5.0.4",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.6.0"
+  }
+}
+```
+
+## 2. tsconfig.json
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+## 3. Main Converter Code
+
+### src/utils.ts
+
+```typescript
+import * as fs from 'fs';
+import * as path from 'path';
+
+export interface ConversionOptions {
+  inputPath: string;
+  outputDir?: string;
+  baseName?: string;
+  preserveFormatting?: boolean;
+  includeImages?: boolean;
+}
+
+export interface ConversionResult {
+  htmlPath: string;
+  mdPath: string;
+  htmlContent: string;
+  mdContent: string;
+}
+
+export function ensureDirectoryExists(dirPath: string): void {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+export function getOutputPaths(options: ConversionOptions): { htmlPath: string; mdPath: string } {
+  const inputDir = path.dirname(options.inputPath);
+  const outputDir = options.outputDir || inputDir;
+  const baseName = options.baseName || path.basename(options.inputPath, '.pdf');
+  
+  ensureDirectoryExists(outputDir);
+  
+  return {
+    htmlPath: path.join(outputDir, `${baseName}.html`),
+    mdPath: path.join(outputDir, `${baseName}.md`)
+  };
+}
+
+export function saveFile(filePath: string, content: string): void {
+  fs.writeFileSync(filePath, content, 'utf-8');
+  console.log(`✅ Saved: ${filePath}`);
+}
+
+export function readFile(filePath: string): Buffer {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+  return fs.readFileSync(filePath);
+}
+```
+
+### src/pdfToHtml.ts
+
+```typescript
+import * as fs from 'fs';
+import pdf from 'pdf-parse';
+
+export interface PDFContent {
+  text: string;
+  numPages: number;
+  info: any;
+  metadata: any;
+  pages: PageContent[];
+}
+
+export interface PageContent {
+  pageNumber: number;
+  text: string;
+  lines: string[];
+}
+
+export interface HTMLOptions {
+  title?: string;
+  includeStyles?: boolean;
+  preserveLineBreaks?: boolean;
+  detectHeadings?: boolean;
+  detectLists?: boolean;
+}
+
+/**
+ * Extract content from PDF file
+ */
+export async function extractPDFContent(pdfPath: string): Promise<PDFContent> {
+  const dataBuffer = fs.readFileSync(pdfPath);
+  
+  const pages: PageContent[] = [];
+  let currentPage = 0;
+  
+  // Custom page render to capture per-page content
+  const options = {
+    pagerender: async function(pageData: any) {
+      const textContent = await pageData.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ');
+      
+      currentPage++;
+      pages.push({
+        pageNumber: currentPage,
+        text: pageText,
+        lines: pageText.split(/\n/).filter((line: string) => line.trim())
+      });
+      
+      return pageText;
+    }
+  };
+  
+  const data = await pdf(dataBuffer, options);
+  
+  return {
+    text: data.text,
+    numPages: data.numpages,
+    info: data.info,
+    metadata: data.metadata,
+    pages: pages.length > 0 ? pages : parseTextIntoPages(data.text, data.numpages)
+  };
+}
+
+/**
+ * Fallback: Parse text into pages if page render didn't work
+ */
+function parseTextIntoPages(text: string, numPages: number): PageContent[] {
+  const lines = text.split('\n').filter(line => line.trim());
+  const linesPerPage = Math.ceil(lines.length / numPages);
+  const pages: PageContent[] = [];
+  
+  for (let i = 0; i < numPages; i++) {
+    const pageLines = lines.slice(i * linesPerPage, (i + 1) * linesPerPage);
+    pages.push({
+      pageNumber: i + 1,
+      text: pageLines.join('\n'),
+      lines: pageLines
+    });
+  }
+  
+  return pages;
+}
+
+/**
+ * Detect if a line is likely a heading
+ */
+function isLikelyHeading(line: string, prevLine: string | null, nextLine: string | null): number {
+  const trimmed = line.trim();
+  
+  // Empty or too long for heading
+  if (!trimmed || trimmed.length > 100) return 0;
+  
+  // All caps short text
+  if (trimmed === trimmed.toUpperCase() && trimmed.length < 50 && /[A-Z]/.test(trimmed)) {
+    return 1;
+  }
+  
+  // Starts with number followed by period (like "1. Introduction")
+  if (/^\d+\.\s+[A-Z]/.test(trimmed)) {
+    return 2;
+  }
+  
+  // Short line followed by longer content
+  if (trimmed.length < 40 && nextLine && nextLine.length > trimmed.length * 2) {
+    return 3;
+  }
+  
+  // Title case short line
+  if (trimmed.length < 50 && /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$/.test(trimmed)) {
+    return 2;
+  }
+  
+  return 0;
+}
+
+/**
+ * Detect if a line is part of a list
+ */
+function detectListType(line: string): 'ul' | 'ol' | null {
+  const trimmed = line.trim();
+  
+  // Bullet points
+  if (/^[•●○▪▫‣⁃\-\*]\s+/.test(trimmed)) {
+    return 'ul';
+  }
+  
+  // Numbered list
+  if (/^\d+[\.\)]\s+/.test(trimmed)) {
+    return 'ol';
+  }
+  
+  // Letter list
+  if (/^[a-zA-Z][\.\)]\s+/.test(trimmed)) {
+    return 'ol';
+  }
+  
+  return null;
+}
+
+/**
+ * Convert PDF content to HTML
+ */
+export function convertToHTML(content: PDFContent, options: HTMLOptions = {}): string {
+  const {
+    title = 'Converted Document',
+    includeStyles = true,
+    preserveLineBreaks = true,
+    detectHeadings = true,
+    detectLists = true
+  } = options;
+  
+  let bodyContent = '';
+  
+  for (const page of content.pages) {
+    bodyContent += `<section class="page" data-page="${page.pageNumber}">\n`;
+    
+    const lines = page.text.split('\n');
+    let inList: 'ul' | 'ol' | null = null;
+    let listItems: string[] = [];
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+      
+      if (!trimmedLine) {
+        // Close any open list
+        if (inList) {
+          bodyContent += `<${inList}>\n${listItems.map(item => `  <li>${item}</li>`).join('\n')}\n</${inList}>\n`;
+          inList = null;
+          listItems = [];
+        }
+        if (preserveLineBreaks) {
+          bodyContent += '<br>\n';
+        }
+        continue;
+      }
+      
+      // Check for list
+      if (detectLists) {
+        const listType = detectListType(trimmedLine);
+        if (listType) {
+          if (inList && inList !== listType) {
+            // Close previous list
+            bodyContent += `<${inList}>\n${listItems.map(item => `  <li>${item}</li>`).join('\n')}\n</${inList}>\n`;
+            listItems = [];
+          }
+          inList = listType;
+          // Remove bullet/number from the text
+          const cleanedText = trimmedLine.replace(/^[•●○▪▫‣⁃\-\*\d+a-zA-Z][\.\)]\s+/, '');
+          listItems.push(escapeHtml(cleanedText));
+          continue;
+        } else if (inList) {
+          // Close the list
+          bodyContent += `<${inList}>\n${listItems.map(item => `  <li>${item}</li>`).join('\n')}\n</${inList}>\n`;
+          inList = null;
+          listItems = [];
+        }
+      }
+      
+      // Check for heading
+      if (detectHeadings) {
+        const headingLevel = isLikelyHeading(
+          trimmedLine,
+          i > 0 ? lines[i - 1] : null,
+          i < lines.length - 1 ? lines[i + 1] : null
+        );
+        
+        if (headingLevel > 0) {
+          const tag = headingLevel === 1 ? 'h1' : headingLevel === 2 ? 'h2' : 'h3';
+          bodyContent += `<${tag}>${escapeHtml(trimmedLine)}</${tag}>\n`;
+          continue;
+        }
+      }
+      
+      // Regular paragraph
+      bodyContent += `<p>${escapeHtml(trimmedLine)}</p>\n`;
+    }
+    
+    // Close any remaining open list
+    if (inList) {
+      bodyContent += `<${inList}>\n${listItems.map(item => `  <li>${item}</li>`).join('\n')}\n</${inList}>\n`;
+    }
+    
+    bodyContent += '</section>\n';
+  }
+  
+  const styles = includeStyles ? getDefaultStyles() : '';
+  
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  ${styles}
+</head>
+<body>
+  <article class="document">
+    ${bodyContent}
+  </article>
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function getDefaultStyles(): string {
+  return `
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      line-height: 1.6;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      color: #333;
+      background-color: #fff;
+    }
+    
+    .document {
+      background: #fff;
+    }
+    
+    .page {
+      margin-bottom: 2em;
+      padding-bottom: 2em;
+      border-bottom: 1px solid #eee;
+    }
+    
+    .page:last-child {
+      border-bottom: none;
+    }
+    
+    h1 {
+      font-size: 2em;
+      color: #1a1a1a;
+      margin-top: 1em;
+      margin-bottom: 0.5em;
+      border-bottom: 2px solid #eee;
+      padding-bottom: 0.3em;
+    }
+    
+    h2 {
+      font-size: 1.5em;
+      color: #2a2a2a;
+      margin-top: 1em;
+      margin-bottom: 0.5em;
+    }
+    
+    h3 {
+      font-size: 1.25em;
+      color: #3a3a3a;
+      margin-top: 1em;
+      margin-bottom: 0.5em;
+    }
+    
+    p {
+      margin: 0.5em 0;
+    }
+    
+    ul, ol {
+      margin: 0.5em 0;
+      padding-left: 2em;
+    }
+    
+    li {
+      margin: 0.25em 0;
+    }
+    
+    @media print {
+      .page {
+        page-break-after: always;
+      }
+    }
+  </style>`;
+}
+```
+
+### src/htmlToMd.ts
+
+```typescript
+import TurndownService from 'turndown';
+import { gfm } from 'turndown-plugin-gfm';
+
+export interface MarkdownOptions {
+  headingStyle?: 'setext' | 'atx';
+  bulletListMarker?: '-' | '+' | '*';
+  codeBlockStyle?: 'indented' | 'fenced';
+  emDelimiter?: '_' | '*';
+  strongDelimiter?: '__' | '**';
+  linkStyle?: 'inlined' | 'referenced';
+  useGfm?: boolean;
+}
+
+/**
+ * Create a configured Turndown service
+ */
+export function createTurndownService(options: MarkdownOptions = {}): TurndownService {
+  const {
+    headingStyle = 'atx',
+    bulletListMarker = '-',
+    codeBlockStyle = 'fenced',
+    emDelimiter = '*',
+    strongDelimiter = '**',
+    linkStyle = 'inlined',
+    useGfm = true
+  } = options;
+  
+  const turndownService = new TurndownService({
+    headingStyle,
+    bulletListMarker,
+    codeBlockStyle,
+    emDelimiter,
+    strongDelimiter,
+    linkStyle
+  });
+  
+  // Use GitHub Flavored Markdown plugin
+  if (useGfm) {
+    turndownService.use(gfm);
+  }
+  
+  // Custom rule for page sections
+  turndownService.addRule('pageSection', {
+    filter: (node) => {
+      return node.nodeName === 'SECTION' && node.classList.contains('page');
+    },
+    replacement: (content, node) => {
+      const pageNum = (node as Element).getAttribute('data-page');
+      if (pageNum && parseInt(pageNum) > 1) {
+        return `\n\n---\n\n<!-- Page ${pageNum} -->\n\n${content}`;
+      }
+      return content;
+    }
+  });
+  
+  // Custom rule for document wrapper
+  turndownService.addRule('documentArticle', {
+    filter: (node) => {
+      return node.nodeName === 'ARTICLE' && node.classList.contains('document');
+    },
+    replacement: (content) => content
+  });
+  
+  // Remove style tags
+  turndownService.addRule('removeStyles', {
+    filter: 'style',
+    replacement: () => ''
+  });
+  
+  // Handle br tags better
+  turndownService.addRule('lineBreaks', {
+    filter: 'br',
+    replacement: () => '\n'
+  });
+  
+  return turndownService;
+}
+
+/**
+ * Convert HTML to Markdown
+ */
+export function convertToMarkdown(html: string, options: MarkdownOptions = {}): string {
+  const turndownService = createTurndownService(options);
+  
+  let markdown = turndownService.turndown(html);
+  
+  // Clean up the markdown
+  markdown = cleanupMarkdown(markdown);
+  
+  return markdown;
+}
+
+/**
+ * Clean up and normalize markdown output
+ */
+function cleanupMarkdown(markdown: string): string {
+  return markdown
+    // Remove excessive blank lines (more than 2 consecutive)
+    .replace(/\n{4,}/g, '\n\n\n')
+    // Remove trailing whitespace from lines
+    .split('\n')
+    .map(line => line.trimEnd())
+    .join('\n')
+    // Ensure file ends with single newline
+    .trim() + '\n';
+}
+
+/**
+ * Convert HTML file to Markdown
+ */
+export function convertHTMLFileToMarkdown(htmlContent: string, options: MarkdownOptions = {}): string {
+  return convertToMarkdown(htmlContent, options);
+}
+```
+
+### src/index.ts
+
+```typescript
+import * as path from 'path';
+import { 
+  ConversionOptions, 
+  ConversionResult, 
+  getOutputPaths, 
+  saveFile, 
+  readFile 
+} from './utils';
+import { extractPDFContent, convertToHTML, HTMLOptions } from './pdfToHtml';
+import { convertToMarkdown, MarkdownOptions } from './htmlToMd';
+
+export interface FullConversionOptions extends ConversionOptions {
+  htmlOptions?: HTMLOptions;
+  mdOptions?: MarkdownOptions;
+}
+
+/**
+ * Convert PDF to HTML and Markdown
+ */
+export async function convertPDF(options: FullConversionOptions): Promise<ConversionResult> {
+  const { inputPath, htmlOptions = {}, mdOptions = {} } = options;
+  
+  console.log(`\n📄 Reading PDF: ${inputPath}`);
+  
+  // Verify file exists
+  readFile(inputPath);
+  
+  // Extract PDF content
+  console.log('📖 Extracting PDF content...');
+  const pdfContent = await extractPDFContent(inputPath);
+  console.log(`   Found ${pdfContent.numPages} page(s)`);
+  
+  // Set title from PDF info or filename
+  const title = pdfContent.info?.Title || 
+                htmlOptions.title || 
+                path.basename(inputPath, '.pdf');
+  
+  // Convert to HTML
+  console.log('🔄 Converting to HTML...');
+  const htmlContent = convertToHTML(pdfContent, { ...htmlOptions, title });
+  
+  // Convert to Markdown
+  console.log('🔄 Converting to Markdown...');
+  const mdContent = convertToMarkdown(htmlContent, mdOptions);
+  
+  // Get output paths
+  const { htmlPath, mdPath } = getOutputPaths(options);
+  
+  // Save files
+  console.log('\n💾 Saving files...');
+  saveFile(htmlPath, htmlContent);
+  saveFile(mdPath, mdContent);
+  
+  console.log('\n✨ Conversion complete!\n');
+  
+  return {
+    htmlPath,
+    mdPath,
+    htmlContent,
+    mdContent
+  };
+}
+
+/**
+ * Main entry point
+ */
+async function main() {
+  // Get input file from command line args or use default
+  const args = process.argv.slice(2);
+  const inputFile = args[0] || 'profile.pdf';
+  const outputDir = args[1] || undefined;
+  
+  // Resolve paths
+  const inputPath = path.resolve(process.cwd(), inputFile);
+  
+  try {
+    const result = await convertPDF({
+      inputPath,
+      outputDir: outputDir ? path.resolve(process.cwd(), outputDir) : undefined,
+      htmlOptions: {
+        includeStyles: true,
+        preserveLineBreaks: true,
+        detectHeadings: true,
+        detectLists: true
+      },
+      mdOptions: {
+        headingStyle: 'atx',
+        bulletListMarker: '-',
+        useGfm: true
+      }
+    });
+    
+    console.log('Output files:');
+    console.log(`  HTML: ${result.htmlPath}`);
+    console.log(`  MD:   ${result.mdPath}`);
+    
+  } catch (error) {
+    console.error('❌ Error:', error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
+}
+
+// Run if this is the main module
+main();
+
+// Export for use as a library
+export { extractPDFContent, convertToHTML, convertToMarkdown };
+export type { PDFContent, PageContent, HTMLOptions } from './pdfToHtml';
+export type { MarkdownOptions } from './htmlToMd';
+```
+
+## 4. Advanced Version with PDF.js (Better Formatting)
+
+### src/pdfToHtmlAdvanced.ts
+
+```typescript
+import * as fs from 'fs';
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Set worker source
+const pdfjsWorker = require('pdfjs-dist/build/pdf.worker.entry');
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+
+export interface TextItem {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fontName: string;
+  fontSize: number;
+}
+
+export interface PDFPageData {
+  pageNumber: number;
+  width: number;
+  height: number;
+  textItems: TextItem[];
+}
+
+export interface AdvancedPDFContent {
+  numPages: number;
+  pages: PDFPageData[];
+  metadata: any;
+}
+
+/**
+ * Extract detailed content from PDF using PDF.js
+ */
+export async function extractPDFAdvanced(pdfPath: string): Promise<AdvancedPDFContent> {
+  const data = new Uint8Array(fs.readFileSync(pdfPath));
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  
+  const pages: PDFPageData[] = [];
+  
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 1.0 });
+    const textContent = await page.getTextContent();
+    
+    const textItems: TextItem[] = textContent.items
+      .filter((item: any) => 'str' in item)
+      .map((item: any) => ({
+        text: item.str,
+        x: item.transform[4],
+        y: viewport.height - item.transform[5], // Flip Y coordinate
+        width: item.width,
+        height: item.height,
+        fontName: item.fontName,
+        fontSize: Math.abs(item.transform[0]) // Approximate font size
+      }));
+    
+    pages.push({
+      pageNumber: i,
+      width: viewport.width,
+      height: viewport.height,
+      textItems
+    });
+  }
+  
+  const metadata = await pdf.getMetadata().catch(() => null);
+  
+  return {
+    numPages: pdf.numPages,
+    pages,
+    metadata: metadata?.info || {}
+  };
+}
+
+/**
+ * Group text items into lines based on Y position
+ */
+function groupIntoLines(items: TextItem[], tolerance: number = 5): TextItem[][] {
+  if (items.length === 0) return [];
+  
+  // Sort by Y position (top to bottom), then X (left to right)
+  const sorted = [...items].sort((a, b) => {
+    if (Math.abs(a.y - b.y) < tolerance) {
+      return a.x - b.x;
+    }
+    return a.y - b.y;
+  });
+  
+  const lines: TextItem[][] = [];
+  let currentLine: TextItem[] = [sorted[0]];
+  let currentY = sorted[0].y;
+  
+  for (let i = 1; i < sorted.length; i++) {
+    const item = sorted[i];
+    if (Math.abs(item.y - currentY) < tolerance) {
+      currentLine.push(item);
+    } else {
+      lines.push(currentLine);
+      currentLine = [item];
+      currentY = item.y;
+    }
+  }
+  
+  if (currentLine.length > 0) {
+    lines.push(currentLine);
+  }
+  
+  return lines;
+}
+
+/**
+ * Detect font size patterns for heading detection
+ */
+function analyzeFontSizes(pages: PDFPageData[]): Map<number, number> {
+  const fontSizeCounts = new Map<number, number>();
+  
+  for (const page of pages) {
+    for (const item of page.textItems) {
+      const size = Math.round(item.fontSize);
+      fontSizeCounts.set(size, (fontSizeCounts.get(size) || 0) + 1);
+    }
+  }
+  
+  return fontSizeCounts;
+}
+
+/**
+ * Convert advanced PDF content to HTML with better structure
+ */
+export function convertAdvancedToHTML(content: AdvancedPDFContent): string {
+  const fontSizes = analyzeFontSizes(content.pages);
+  
+  // Find most common font size (body text)
+  let bodyFontSize = 12;
+  let maxCount = 0;
+  fontSizes.forEach((count, size) => {
+    if (count > maxCount) {
+      maxCount = count;
+      bodyFontSize = size;
+    }
+  });
+  
+  let bodyContent = '';
+  
+  for (const page of content.pages) {
+    bodyContent += `<section class="page" data-page="${page.pageNumber}">\n`;
+    
+    const lines = groupIntoLines(page.textItems);
+    
+    for (const lineItems of lines) {
+      // Combine text items in the line
+      const lineText = lineItems.map(item => item.text).join(' ').trim();
+      if (!lineText) continue;
+      
+      // Determine if this is a heading based on font size
+      const avgFontSize = lineItems.reduce((sum, item) => sum + item.fontSize, 0) / lineItems.length;
+      const fontSizeRatio = avgFontSize / bodyFontSize;
+      
+      let tag = 'p';
+      if (fontSizeRatio > 1.5) {
+        tag = 'h1';
+      } else if (fontSizeRatio > 1.25) {
+        tag = 'h2';
+      } else if (fontSizeRatio > 1.1) {
+        tag = 'h3';
+      }
+      
+      // Check for bold (rough heuristic based on font name)
+      const hasBold = lineItems.some(item => 
+        item.fontName.toLowerCase().includes('bold') ||
+        item.fontName.toLowerCase().includes('heavy')
+      );
+      
+      const escapedText = escapeHtml(lineText);
+      const wrappedText = hasBold && tag === 'p' ? `<strong>${escapedText}</strong>` : escapedText;
+      
+      bodyContent += `  <${tag}>${wrappedText}</${tag}>\n`;
+    }
+    
+    bodyContent += '</section>\n';
+  }
+  
+  const title = content.metadata?.Title || 'Converted Document';
+  
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  ${getStyles()}
+</head>
+<body>
+  <article class="document">
+    ${bodyContent}
+  </article>
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function getStyles(): string {
+  return `<style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+      color: #333;
+    }
+    .page { margin-bottom: 2em; padding-bottom: 2em; border-bottom: 1px solid #eee; }
+    h1 { font-size: 2em; color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; color: #2a2a2a; }
+    h3 { font-size: 1.25em; color: #3a3a3a; }
+    p { margin: 0.5em 0; }
+  </style>`;
+}
+```
+
+## 5. Simple Standalone Version (Single File)
+
+### converter.ts
+
+```typescript
+/**
+ * Simple PDF to HTML to Markdown Converter
+ * Single file version for easy use
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import pdf from 'pdf-parse';
+import TurndownService from 'turndown';
+
+interface ConversionResult {
+  html: string;
+  markdown: string;
+  htmlPath: string;
+  mdPath: string;
+}
+
+async function convertPDFToHTMLAndMarkdown(
+  pdfPath: string,
+  outputDir?: string
+): Promise<ConversionResult> {
+  
+  // Read PDF
+  console.log(`📄 Reading: ${pdfPath}`);
+  const dataBuffer = fs.readFileSync(pdfPath);
+  const pdfData = await pdf(dataBuffer);
+  
+  // Generate HTML
+  console.log('🔄 Converting to HTML...');
+  const html = generateHTML(pdfData.text, pdfData.info?.Title || path.basename(pdfPath, '.pdf'));
+  
+  // Convert to Markdown
+  console.log('🔄 Converting to Markdown...');
+  const turndown = new TurndownService({
+    headingStyle: 'atx',
+    bulletListMarker: '-'
+  });
+  const markdown = turndown.turndown(html);
+  
+  // Determine output paths
+  const dir = outputDir || path.dirname(pdfPath);
+  const baseName = path.basename(pdfPath, '.pdf');
+  const htmlPath = path.join(dir, `${baseName}.html`);
+  const mdPath = path.join(dir, `${baseName}.md`);
+  
+  // Save files
+  fs.writeFileSync(htmlPath, html);
+  console.log(`✅ Saved: ${htmlPath}`);
+  
+  fs.writeFileSync(mdPath, markdown);
+  console.log(`✅ Saved: ${mdPath}`);
+  
+  return { html, markdown, htmlPath, mdPath };
+}
+
+function generateHTML(text: string, title: string): string {
+  const lines = text.split('\n');
+  let body = '';
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      body += '<br>\n';
+      continue;
+    }
+    
+    // Simple heading detection (all caps or short lines)
+    if (trimmed === trimmed.toUpperCase() && trimmed.length < 50 && /[A-Z]/.test(trimmed)) {
+      body += `<h2>${escapeHtml(trimmed)}</h2>\n`;
+    }
+    // Bullet points
+    else if (/^[•\-\*]\s+/.test(trimmed)) {
+      body += `<li>${escapeHtml(trimmed.replace(/^[•\-\*]\s+/, ''))}</li>\n`;
+    }
+    // Regular paragraph
+    else {
+      body += `<p>${escapeHtml(trimmed)}</p>\n`;
+    }
+  }
+  
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+    h1, h2 { color: #333; }
+    p { margin: 0.5em 0; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(title)}</h1>
+  ${body}
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Main execution
+const inputFile = process.argv[2] || 'profile.pdf';
+convertPDFToHTMLAndMarkdown(inputFile)
+  .then(result => {
+    console.log('\n✨ Done!');
+    console.log(`HTML: ${result.htmlPath}`);
+    console.log(`Markdown: ${result.mdPath}`);
+  })
+  .catch(err => {
+    console.error('❌ Error:', err.message);
+    process.exit(1);
+  });
+```
+
+## 6. Usage Instructions
+
+### Installation
+
+```bash
+# Create project directory
+mkdir pdf-converter && cd pdf-converter
+
+# Initialize npm
+npm init -y
+
+# Install dependencies
+npm install pdf-parse pdfjs-dist turndown turndown-plugin-gfm
+npm install -D typescript ts-node tsx @types/node @types/turndown
+
+# If you need canvas support for PDF.js (optional)
+npm install canvas
+```
+
+### Running the Converter
+
+```bash
+# Using ts-node
+npx ts-node src/index.ts profile.pdf
+
+# Using tsx (faster)
+npx tsx src/index.ts profile.pdf
+
+# With output directory
+npx tsx src/index.ts profile.pdf ./output
+
+# Build and run JavaScript
+npm run build
+node dist/index.js profile.pdf
+```
+
+### Using as a Library
+
+```typescript
+import { convertPDF } from './src/index';
+
+async function example() {
+  const result = await convertPDF({
+    inputPath: './documents/profile.pdf',
+    outputDir: './output',
+    htmlOptions: {
+      includeStyles: true,
+      detectHeadings: true
+    },
+    mdOptions: {
+      headingStyle: 'atx',
+      bulletListMarker: '-'
+    }
+  });
+  
+  console.log('HTML saved to:', result.htmlPath);
+  console.log('Markdown saved to:', result.mdPath);
+}
+```
+
+## Summary
+
+| Feature | Description |
+|---------|-------------|
+| **PDF Reading** | Uses `pdf-parse` or `pdfjs-dist` |
+| **HTML Generation** | Custom HTML with heading/list detection |
+| **Markdown Conversion** | Uses `turndown` with GFM support |
+| **Styling** | Includes default CSS in HTML |
+| **Heading Detection** | Based on caps, font size, line length |
+| **List Detection** | Bullets, numbers, letters |
+
+The code handles:
+- ✅ Multi-page PDFs
+- ✅ Automatic heading detection
+- ✅ List detection (ordered/unordered)
+- ✅ Clean HTML with semantic markup
+- ✅ GitHub-flavored Markdown output
+- ✅ Configurable options
+- ✅ TypeScript support
